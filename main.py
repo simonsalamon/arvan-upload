@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-ArvanCloud Storage CLI – Upload a file or folder to ArvanCloud Object Storage.
+ArvanCloud Storage CLI – Upload files/folders to ArvanCloud Object Storage.
 
-Credentials can be provided via:
-  1. Command-line options -a / -s
+Credentials priority:
+  1. Command-line -a/-s
   2. Environment variables ARVAN_ACCESS_KEY / ARVAN_SECRET_KEY
-  3. A credentials file (INI format), default: ~/.arvan/credentials
+  3. Credentials file (default ~/.arvan/credentials, profile "default")
+
+Features:
+  - Recursive folder upload (preserves directory structure)
+  - Automatic fallback to single PUT if multipart upload is denied
+  - Optional public-read ACL
 """
 
 import argparse
@@ -16,18 +21,20 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
+from botocore.exceptions import ClientError
 
 
-def get_credentials_file_path(path_arg=None):
-    """Return the path to the credentials file."""
-    if path_arg:
-        return os.path.expanduser(path_arg)
+# --- Credential handling ----------------------------------------------------
+
+def get_credentials_file_path(custom_path=None):
+    """Return expanded path to the credentials file."""
+    if custom_path:
+        return os.path.expanduser(custom_path)
     return os.path.join(Path.home(), ".arvan", "credentials")
 
 
 def read_credentials_file(filepath, profile="default"):
-    """Read access/secret keys from an INI-style credentials file."""
+    """Read access/secret keys from an INI file."""
     if not os.path.isfile(filepath):
         return None, None
 
@@ -43,19 +50,14 @@ def read_credentials_file(filepath, profile="default"):
 
 
 def resolve_credentials(args):
-    """
-    Determine final credentials using priority:
-      1. CLI args  (-a / -s)
-      2. Environment variables
-      3. Credentials file (default or specified)
-    """
+    """Determine final credentials using CLI > env > file priority."""
     access = args.access_key
     secret = args.secret_key
 
     if access and secret:
         return access, secret
 
-    # Try environment
+    # Environment variables
     if not access:
         access = os.environ.get("ARVAN_ACCESS_KEY")
     if not secret:
@@ -64,18 +66,17 @@ def resolve_credentials(args):
     if access and secret:
         return access, secret
 
-    # Try credentials file
+    # Credentials file
     cred_file = get_credentials_file_path(args.credentials_file)
     profile = args.profile or "default"
     file_access, file_secret = read_credentials_file(cred_file, profile)
-    if file_access and file_secret:
-        return file_access, file_secret
+    return file_access, file_secret
 
-    return None, None
 
+# --- S3 client --------------------------------------------------------------
 
 def build_client(access_key, secret_key, endpoint_url, region="ir-thr-at1"):
-    """Create a boto3 S3 client pointed at ArvanCloud."""
+    """Create a boto3 S3 client configured for ArvanCloud."""
     return boto3.client(
         "s3",
         aws_access_key_id=access_key,
@@ -86,42 +87,37 @@ def build_client(access_key, secret_key, endpoint_url, region="ir-thr-at1"):
     )
 
 
+# --- Upload functions -------------------------------------------------------
+
 def upload_single_file(client, bucket, local_path, object_key):
-    """Upload one file. Return the object key used."""
+    """
+    Upload a single file.
+
+    Attempts the normal upload (which auto-uses multipart for files > 8 MB).
+    If that fails with AccessDenied, falls back to a simple PUT.
+    """
     if not os.path.isfile(local_path):
         raise FileNotFoundError(f"Not a file: {local_path}")
 
-    print(f"  Uploading: {local_path}  ->  s3://{bucket}/{object_key}")
-    client.upload_file(local_path, bucket, object_key)
-    return object_key
+    size_mb = os.path.getsize(local_path) / (1024 * 1024)
 
-
-def upload_directory(client, bucket, local_dir, prefix="", public_read=False):
-    """Recursively upload all files inside a directory."""
-    local_dir = os.path.abspath(local_dir)
-    if not os.path.isdir(local_dir):
-        raise NotADirectoryError(f"Not a directory: {local_dir}")
-
-    if not prefix:
-        prefix = os.path.basename(local_dir) + "/"
-    if not prefix.endswith("/"):
-        prefix += "/"
-
-    for root, _, files in os.walk(local_dir):
-        for name in files:
-            full_path = os.path.join(root, name)
-            rel_path = os.path.relpath(full_path, local_dir).replace(os.sep, "/")
-            key = prefix + rel_path
-            try:
-                upload_single_file(client, bucket, full_path, key)
-                if public_read:
-                    set_public_acl(client, bucket, key)
-            except Exception as exc:
-                print(f"    ⚠️  Skipped: {full_path} - {exc}", file=sys.stderr)
+    try:
+        print(f"  Uploading: {local_path} ({size_mb:.1f} MB) -> s3://{bucket}/{object_key}")
+        client.upload_file(local_path, bucket, object_key)
+        return object_key
+    except ClientError as exc:
+        if exc.response['Error']['Code'] == 'AccessDenied' and "MultipartUpload" in str(exc):
+            # Fallback to single PUT
+            print(f"  ⚠️  Multipart denied — switching to single PUT for this file.", file=sys.stderr)
+            with open(local_path, 'rb') as data:
+                client.put_object(Bucket=bucket, Key=object_key, Body=data)
+            print(f"  ✓ Single PUT successful: s3://{bucket}/{object_key}")
+            return object_key
+        raise  # re-raise other errors
 
 
 def set_public_acl(client, bucket, key):
-    """Make an object publicly readable."""
+    """Set ACL to public-read for the given object."""
     try:
         client.put_object_acl(ACL="public-read", Bucket=bucket, Key=key)
         print(f"    ✓ ACL public-read: s3://{bucket}/{key}")
@@ -129,18 +125,55 @@ def set_public_acl(client, bucket, key):
         print(f"    ⚠️  Could not set ACL on {key}: {exc}", file=sys.stderr)
 
 
+def upload_directory(client, bucket, local_dir, prefix="", public_read=False):
+    """
+    Recursively upload all files inside a directory.
+
+    The S3 key for each file becomes: <prefix><relative_path_from_dir>
+    Uses forward slashes and excludes empty directories.
+    """
+    local_dir = os.path.abspath(local_dir)
+    if not os.path.isdir(local_dir):
+        raise NotADirectoryError(f"Not a directory: {local_dir}")
+
+    # Default prefix = directory name
+    if not prefix:
+        prefix = os.path.basename(local_dir) + "/"
+    if not prefix.endswith("/"):
+        prefix += "/"
+
+    print(f"📁 Uploading folder: {local_dir} -> s3://{bucket}/{prefix}...")
+
+    for root, _, files in os.walk(local_dir):
+        for name in files:
+            full_path = os.path.join(root, name)
+            rel_path = os.path.relpath(full_path, local_dir).replace(os.sep, "/")
+            key = prefix + rel_path
+
+            try:
+                upload_single_file(client, bucket, full_path, key)
+                if public_read:
+                    set_public_acl(client, bucket, key)
+            except Exception as exc:
+                print(f"    ❌ Failed: {full_path} – {exc}", file=sys.stderr)
+                # Continue with other files
+
+
+# --- CLI --------------------------------------------------------------------
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Upload a file or folder to ArvanCloud Object Storage (S3 compatible).",
+        description="Upload files/folders to ArvanCloud Object Storage.",
         epilog="For more help, visit https://docs.arvancloud.ir",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument("bucket", help="Target bucket name.")
-    parser.add_argument("path", help="Local file or directory to upload (directories are recursive).")
+    parser.add_argument("path", help="Local file or directory to upload. Directories are recursive.")
 
     parser.add_argument("-k", "--key",
                         help="Object key for a single file, or base prefix for a directory. "
-                             "If omitted, the directory’s own name is used as the prefix.")
+                             "If omitted, the directory name is used as prefix.")
     parser.add_argument("-e", "--endpoint",
                         default="https://s3.ir-thr-at1.arvanstorage.ir",
                         help="ArvanCloud S3 endpoint (default: %(default)s).")
@@ -148,11 +181,10 @@ def parse_args():
                         default="ir-thr-at1",
                         help="AWS region (default: %(default)s).")
     parser.add_argument("-a", "--access-key",
-                        help="Access key ID (overrides env and file).")
+                        help="Access key ID (overrides env & file).")
     parser.add_argument("-s", "--secret-key",
-                        help="Secret access key (overrides env and file).")
+                        help="Secret access key (overrides env & file).")
     parser.add_argument("--credentials-file",
-                        default=None,
                         help="Path to INI credentials file (default: ~/.arvan/credentials).")
     parser.add_argument("--profile",
                         default="default",
@@ -160,6 +192,9 @@ def parse_args():
     parser.add_argument("--public-read",
                         action="store_true",
                         help="Set ACL to 'public-read' on every uploaded object.")
+    parser.add_argument("--no-multipart",
+                        action="store_true",
+                        help="Force single PUT upload for all files (bypasses multipart entirely).")
 
     return parser.parse_args()
 
@@ -176,12 +211,28 @@ def main():
         )
         sys.exit(1)
 
+    # If --no-multipart is set, override upload_single_file to always use put_object
+    if args.no_multipart:
+        global upload_single_file  # we'll patch it
+        original_upload = upload_single_file
+
+        def forced_single_put(client, bucket, local_path, object_key):
+            """Always use put_object (no multipart)."""
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(f"Not a file: {local_path}")
+            size_mb = os.path.getsize(local_path) / (1024 * 1024)
+            print(f"  [single PUT] {local_path} ({size_mb:.1f} MB) -> s3://{bucket}/{object_key}")
+            with open(local_path, 'rb') as data:
+                client.put_object(Bucket=bucket, Key=object_key, Body=data)
+            return object_key
+
+        upload_single_file = forced_single_put
+
     client = build_client(access_key, secret_key, args.endpoint, args.region)
 
     given_path = os.path.abspath(args.path)
 
     if os.path.isdir(given_path):
-        print(f"📁 Uploading folder: {given_path}")
         prefix = args.key if args.key else ""
         try:
             upload_directory(client, args.bucket, given_path, prefix, args.public_read)

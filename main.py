@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import threading
+import time                               # added for retry delay
 from pathlib import Path
 from typing import Optional
 
@@ -54,40 +55,46 @@ class ProgressPercentage:
 
 
 def upload_file(file_path: str, bucket: str, object_name: Optional[str] = None,
-                acl: str = 'public-read'):
+                acl: str = 'public-read') -> bool:
+    """
+    Uploads a file to an S3 bucket, retrying indefinitely on any error.
+    Returns True once the upload succeeds (never returns False).
+    """
     if object_name is None:
         object_name = file_path
 
     file_size = os.path.getsize(file_path)
     logging.info(f"File size: {file_size / MB:.2f} MB")
 
-    try:
-        if file_size <= MULTIPART_THRESHOLD:
-            with open(file_path, "rb") as f:
-                s3_resource.Bucket(bucket).put_object(
-                    ACL=acl,
-                    Body=f,
-                    Key=object_name
+    while True:   # retry forever until success
+        try:
+            if file_size <= MULTIPART_THRESHOLD:
+                with open(file_path, "rb") as f:
+                    s3_resource.Bucket(bucket).put_object(
+                        ACL=acl,
+                        Body=f,
+                        Key=object_name
+                    )
+                logging.info("Uploaded with simple put_object")
+            else:
+                config = TransferConfig(
+                    multipart_threshold=MULTIPART_THRESHOLD,
+                    max_concurrency=5
                 )
-            logging.info("Uploaded with simple put_object")
-        else:
-            config = TransferConfig(
-                multipart_threshold=MULTIPART_THRESHOLD,
-                max_concurrency=5
-            )
-            s3_client.upload_file(
-                file_path,
-                bucket,
-                object_name,
-                ExtraArgs={'ACL': acl},
-                Callback=ProgressPercentage(file_path),
-                Config=config
-            )
-            logging.info("Uploaded with multipart upload")
-    except ClientError as e:
-        logging.error(f"Upload failed: {e}")
-        return False
-    return True
+                s3_client.upload_file(
+                    file_path,
+                    bucket,
+                    object_name,
+                    ExtraArgs={'ACL': acl},
+                    Callback=ProgressPercentage(file_path),
+                    Config=config
+                )
+                logging.info("Uploaded with multipart upload")
+            return True   # success, exit the loop
+
+        except Exception as e:   # catch all errors to guarantee a retry
+            logging.error(f"Upload failed: {e}. Retrying in 5 seconds...")
+            time.sleep(5)        # short delay before retrying
 
 
 def upload_directory(local_dir: str, bucket: str, s3_prefix: str = ""):
@@ -109,11 +116,11 @@ def upload_directory(local_dir: str, bucket: str, s3_prefix: str = ""):
         relative_path = file_path.relative_to(base_path)
         s3_key = (Path(s3_prefix) / relative_path).as_posix()
         logging.info(f"Uploading {file_path} -> s3://{bucket}/{s3_key}")
-        success = upload_file(str(file_path), bucket, s3_key)
-        if success:
-            logging.info("OK")
-        else:
-            logging.error(f"Upload failed for {file_path}")
+
+        # upload_file now blocks until success (never returns False)
+        upload_file(str(file_path), bucket, s3_key)
+        logging.info("Upload successful. Deleting local file.")
+        os.remove(file_path)      # remove the local copy after successful upload
 
 
 if __name__ == "__main__":
